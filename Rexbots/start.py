@@ -1,0 +1,1153 @@
+# Rexbots
+# Don't Remove Credit
+# Telegram Channel @RexBots_Official
+
+import os
+import asyncio
+import random
+import time
+import shutil
+import pyrogram
+from pyrogram import Client, filters, enums
+from pyrogram.errors import (
+    FloodWait, UserIsBlocked, InputUserDeactivated, UserAlreadyParticipant, 
+    InviteHashExpired, UsernameNotOccupied, AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan
+)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from config import API_ID, API_HASH, ERROR_MESSAGE
+from database.db import db
+import math
+from Rexbots.strings import HELP_TXT, COMMANDS_TXT
+from logger import LOGGER
+
+# ==================== NEW: FFMPEG THUMBNAIL FUNCTIONS ====================
+
+async def _get_video_duration(file_path: str) -> float:
+    """
+    Use ffprobe to get the exact duration (in seconds) of a video file.
+    Returns 0.0 if ffprobe fails or the file has no video stream.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        text = stdout.decode().strip()
+        if text and text != "N/A":
+            return float(text)
+        # Some containers store duration at the format level, not stream level
+        proc2 = await asyncio.create_subprocess_exec(
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout2, _ = await proc2.communicate()
+        text2 = stdout2.decode().strip()
+        if text2 and text2 != "N/A":
+            return float(text2)
+    except Exception:
+        pass
+    return 0.0
+
+async def _run_ffmpeg_thumb(args: list, out_path: str) -> bool:
+    """Run an ffmpeg command and return True if a valid JPEG was produced."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 1024
+    except Exception:
+        return False
+
+def is_blank_image(image_path: str, threshold: float = 10.0) -> bool:
+    """
+    Returns True if the image is mostly black / blank.
+    Uses Pillow if available; otherwise falls back to file‑size heuristics.
+    """
+    try:
+        from PIL import Image, ImageStat
+        img = Image.open(image_path).convert('L')  # grayscale
+        stat = ImageStat.Stat(img)
+        mean_brightness = stat.mean[0]  # average pixel value 0–255
+        return mean_brightness < threshold
+    except ImportError:
+        # Fallback: assume image is blank if file size is unusually small
+        # (a true video frame usually > 5 KB)
+        return os.path.getsize(image_path) < 5120
+
+def get_seek_candidates(duration: float) -> list[float]:
+    """
+    Return a list of seek positions (seconds) ordered from best to worst.
+    This increases the chance of finding a non‑blank frame.
+    """
+    if duration <= 0:
+        return [0.0]
+
+    candidates = []
+    # 1. 33% – well past intros
+    candidates.append(duration * 0.33)
+    # 2. 10 seconds
+    if duration > 11:
+        candidates.append(10.0)
+    # 3. 25% and 50%
+    candidates.append(duration * 0.25)
+    candidates.append(duration * 0.5)
+    # 4. 1 second
+    if duration > 2:
+        candidates.append(1.0)
+    # 5. 75%
+    candidates.append(duration * 0.75)
+    # 6. Very first frame (last resort)
+    candidates.append(0.0)
+
+    # Remove duplicates and clamp to valid range
+    seen = set()
+    unique = []
+    for c in candidates:
+        c = max(0.0, min(c, duration - 0.5))
+        c = round(c, 2)
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    return unique
+
+async def _extract_frame(file_path: str, out_path: str, seek_secs: float) -> bool:
+    """
+    Extract a single JPEG frame from `file_path` at position `seek_secs`.
+
+    Uses a direct frame‑grab approach (no 'thumbnail' filter) for better
+    compatibility across all video codecs (H.264, H.265, VP9, AV1).
+    """
+    pre_seek = max(0.0, seek_secs - 2.0)
+    post_seek = min(seek_secs, 2.0)
+
+    # Clean any leftover file from a previous attempt
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    # Strategy 1: Direct frame grab with scaling to even dimensions
+    if await _run_ffmpeg_thumb([
+        "ffmpeg", "-y",
+        "-ss", str(pre_seek),
+        "-i", file_path,
+        "-ss", str(post_seek),
+        "-map", "0:v:0",
+        "-vframes", "1",
+        "-vf", "scale=320:trunc(ow/a/2)*2",
+        "-q:v", "2",
+        out_path,
+    ], out_path):
+        return True
+
+    if os.path.exists(out_path):
+        os.remove(out_path)
+
+    # Strategy 2: Bare minimum – no map, no filter
+    if await _run_ffmpeg_thumb([
+        "ffmpeg", "-y",
+        "-ss", str(seek_secs),
+        "-i", file_path,
+        "-vframes", "1",
+        "-q:v", "2",
+        out_path,
+    ], out_path):
+        return True
+
+    return False
+
+async def get_thumb(user_id: int, acc, msg_type: str, msg, file_path: str) -> str | None:
+    """
+    Thumbnail resolution order:
+    1. Custom thumbnail set by the user (stored in DB as Telegram file_id).
+       Falls through to FFmpeg if not set, expired, or download fails.
+    2. For Video/Document: auto-extract a real frame using FFmpeg + ffprobe.
+       - ffprobe detects the actual duration so we never seek past the end.
+       - Multiple seek candidates are tried until a non‑blank frame is found.
+    3. None → no thumbnail.
+
+    The returned path is always a local .jpg file that the caller must
+    delete after uploading.
+    """
+    os.makedirs("thumbs", exist_ok=True)
+    from pyrogram.errors import FileReferenceExpired as _FRE
+
+    # ── 1. Custom thumbnail from DB ──────────────────────────────────────────
+    custom_file_id = await db.get_thumbnail(user_id)
+    if custom_file_id:
+        for _attempt in range(2):
+            try:
+                dl_path = await acc.download_media(
+                    custom_file_id,
+                    file_name=f"thumbs/{user_id}_custom.jpg"
+                )
+                if dl_path and os.path.exists(dl_path) and os.path.getsize(dl_path) > 0:
+                    return dl_path
+                if dl_path and os.path.exists(dl_path):
+                    os.remove(dl_path)
+                break
+            except _FRE:
+                if _attempt == 0:
+                    await asyncio.sleep(3)
+                    continue
+                break
+            except Exception:
+                break
+
+    # ── 2. FFmpeg auto-thumbnail for Video / Document ────────────────────────
+    if msg_type in ("Video", "Document"):
+        ffmpeg_out = f"thumbs/{user_id}_auto.jpg"
+
+        # Detect actual duration so we never seek past the end of the video.
+        duration = await _get_video_duration(file_path)
+
+        # Try multiple seek positions until we get a non‑blank thumbnail
+        for seek_secs in get_seek_candidates(duration):
+            if await _extract_frame(file_path, ffmpeg_out, seek_secs):
+                # Check if the extracted frame is blank
+                if not is_blank_image(ffmpeg_out):
+                    return ffmpeg_out
+                # Blank frame → remove and try next candidate
+                if os.path.exists(ffmpeg_out):
+                    os.remove(ffmpeg_out)
+            else:
+                # Clean up any zero‑byte / corrupt output
+                if os.path.exists(ffmpeg_out):
+                    os.remove(ffmpeg_out)
+
+    return None
+
+# ==================== END OF NEW FFMPEG FUNCTIONS ====================
+
+def humanbytes(size):
+    if not size:
+        return ""
+    power = 2**10
+    n = 0
+    Dic_powerN = {0: ' ', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
+    while size > power:
+        size /= power
+        n += 1
+    return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
+
+def TimeFormatter(milliseconds: int) -> str:
+    seconds, milliseconds = divmod(int(milliseconds), 1000)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    tmp = ((str(days) + "d, ") if days else "") + \
+        ((str(hours) + "h, ") if hours else "") + \
+        ((str(minutes) + "m, ") if minutes else "") + \
+        ((str(seconds) + "s, ") if seconds else "")
+    
+    if not tmp:
+        tmp = ((str(milliseconds) + "ms, ") if milliseconds else "")
+        
+    return tmp[:-2] if tmp else "0s"
+
+logger = LOGGER(__name__)
+
+class batch_temp(object):
+    IS_BATCH = {}
+    # Store last upload time for each user
+    LAST_UPLOAD_TIME = {}
+
+# -------------------
+# Supported Telegram Reactions
+# -------------------
+
+REACTIONS = [
+    "🤝", "😇", "🤗", "😍", "👍", "🎅", "😐", "🥰", "🤩",
+    "😱", "🤣", "😘", "👏", "😛", "😈", "🎉", "⚡️", "🫡",
+    "🤓", "😎", "🏆", "🔥", "🤭", "🌚", "🆒", "👻", "😁"
+]
+
+PROGRESS_BAR_DASHBOARD  = """\
+<blockquote>
+✦ <code>{bar}</code> • <b>{percentage:.1f}%</b><br>
+››  <b>Speed</b> • <code>{speed}/s</code><br>
+››  <b>Size</b> • <code>{current} / {total}</code><br>
+››  <b>ETA</b> • <code>{eta}</code><br>
+››  <b>Elapsed</b> • <code>{elapsed}</code>
+</blockquote>
+"""
+
+# -------------------
+# Download status
+# -------------------
+
+async def downstatus(client, statusfile, message, chat):
+    while not os.path.exists(statusfile):
+        await asyncio.sleep(3)
+    while os.path.exists(statusfile):
+        try:
+            with open(statusfile, "r", encoding='utf-8') as downread:
+                txt = downread.read()
+            await client.edit_message_text(chat, message.id, f"📥 **Downloading...**\n\n{txt}")
+            await asyncio.sleep(10)
+        except:
+            await asyncio.sleep(5)
+
+# -------------------
+# Upload status
+# -------------------
+
+async def upstatus(client, statusfile, message, chat):
+    while not os.path.exists(statusfile):
+        await asyncio.sleep(3)
+    while os.path.exists(statusfile):
+        try:
+            with open(statusfile, "r", encoding='utf-8') as upread:
+                txt = upread.read()
+            await client.edit_message_text(chat, message.id, f"📤 **Uploading...**\n\n{txt}")
+            await asyncio.sleep(10)
+        except:
+            await asyncio.sleep(5)
+
+# -------------------
+# Progress writer
+# -------------------
+
+def progress(current, total, message, type):
+    # Check for cancellation
+    if batch_temp.IS_BATCH.get(message.from_user.id):
+        raise Exception("Cancelled")
+
+    # Initialize cache if not exists
+    if not hasattr(progress, "cache"):
+        progress.cache = {}
+    
+    now = time.time()
+    task_id = f"{message.id}{type}"
+    last_time = progress.cache.get(task_id, 0)
+    
+    # Track start time for speed calc
+    if not hasattr(progress, "start_time"):
+        progress.start_time = {}
+    if task_id not in progress.start_time:
+        progress.start_time[task_id] = now
+        
+    # Update only every 3 seconds or if completed
+    if (now - last_time) > 3 or current == total:
+        try:
+            percentage = current * 100 / total
+            speed = current / (now - progress.start_time[task_id])
+            eta = (total - current) / speed if speed > 0 else 0
+            elapsed = now - progress.start_time[task_id]
+            
+            # Progress Bar
+            filled_length = int(percentage / 10) # 10 blocks for 100%
+            bar = '▰' * filled_length + '▱' * (10 - filled_length)
+            
+            status = PROGRESS_BAR_DASHBOARD.format(
+                bar=bar,
+                percentage=percentage,
+                current=humanbytes(current),
+                total=humanbytes(total),
+                speed=humanbytes(speed),
+                eta=TimeFormatter(eta * 1000),
+                elapsed=TimeFormatter(elapsed * 1000)
+            )
+            
+            with open(f'{message.id}{type}status.txt', "w", encoding='utf-8') as fileup:
+                fileup.write(status)
+                
+            progress.cache[task_id] = now
+            
+            if current == total:
+                # Cleanup cache
+                progress.start_time.pop(task_id, None)
+                progress.cache.pop(task_id, None)
+                
+        except:
+            pass
+
+# -------------------
+# Start command
+# -------------------
+
+@Client.on_message(filters.command(["start"]))
+async def send_start(client: Client, message: Message):
+    if not await db.is_user_exist(message.from_user.id):
+        await db.add_user(message.from_user.id, message.from_user.first_name)
+
+    buttons = [
+        [
+            InlineKeyboardButton("🆘 How To Use", callback_data="help_btn"),
+            InlineKeyboardButton("ℹ️ About Bot", callback_data="about_btn"),
+        ],
+        [
+             InlineKeyboardButton("⚙️ Settings", callback_data="settings_btn")
+        ],
+        [
+            InlineKeyboardButton('📢 Official Channel', url='https://t.me/RexBots_Official'),
+            InlineKeyboardButton('👨‍💻 Developer', url='https://t.me/about_zani/143')
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(buttons)
+
+    await client.send_message(
+        chat_id=message.chat.id,
+        text=(
+            f"<blockquote><b>👋 Welcome {message.from_user.mention}!</b></blockquote>\n\n"
+            "<b>I am the Advanced Save Restricted Content Bot by RexBots.</b>\n\n"
+            "<blockquote><b>🚀 What I Can Do:</b>\n"
+            "<b>‣ Save Restricted Post (Text, Media, Files)</b>\n"
+            "<b>‣ Support Private & Public Channels</b>\n"
+            "<b>‣ Batch/Bulk Mode Supported</b></blockquote>\n\n"
+            "<blockquote><b>⚠️ Note:</b> <i>You must <code>/login</code> to your account to use the downloading features.</i></blockquote>"
+        ),
+        reply_markup=reply_markup,
+        reply_to_message_id=message.id,
+        parse_mode=enums.ParseMode.HTML
+    )
+
+# -------------------
+# Help command (standalone)
+# -------------------
+
+@Client.on_message(filters.command(["help"]))
+async def send_help(client: Client, message: Message):
+    await client.send_message(
+        chat_id=message.chat.id,
+        text=f"{HELP_TXT}"
+    )
+
+# -------------------
+# Cancel command
+# -------------------
+
+@Client.on_message(filters.command(["cancel"]))
+async def send_cancel(client: Client, message: Message):
+    batch_temp.IS_BATCH[message.from_user.id] = True
+    await message.reply_text("❌ Batch Process Cancelled Successfully.")
+
+# -------------------
+# Handle incoming messages
+# -------------------
+
+@Client.on_message(filters.text & filters.private & ~filters.regex("^/"))
+async def save(client: Client, message: Message):
+    if "https://t.me/" in message.text:
+        if batch_temp.IS_BATCH.get(message.from_user.id) == False:
+            return await message.reply_text(
+                "One Task Is Already Processing. Wait For Complete It. If You Want To Cancel This Task Then Use - /cancel"
+            )
+
+        datas = message.text.split("/")
+        temp = datas[-1].replace("?single", "").split("-")
+        fromID = int(temp[0].strip())
+        try:
+            toID = int(temp[1].strip())
+        except:
+            toID = fromID
+
+        batch_temp.IS_BATCH[message.from_user.id] = False
+
+        is_private = "https://t.me/c/" in message.text
+        is_batch = "https://t.me/b/" in message.text
+
+        # ─── PREMIUM CHECK ───────────────────────────────────────────────────
+        needs_restricted_access = is_private or is_batch
+        if is_private or is_batch:
+            import datetime
+            expiry = await db.check_premium(message.from_user.id)
+            is_premium = False
+            if expiry:
+                try:
+                    exp_date = datetime.datetime.fromisoformat(expiry)
+                    if datetime.datetime.now() < exp_date:
+                        is_premium = True
+                    else:
+                        await db.remove_premium(message.from_user.id)
+                except Exception:
+                    pass
+
+            if not is_premium:
+                batch_temp.IS_BATCH[message.from_user.id] = True
+                return await message.reply_text(
+                    "**💎 Premium Required**\n\n"
+                    "Downloading restricted/private content is a **Premium-only** feature.\n\n"
+                    "Use /premium to view plans and upgrade your account."
+                )
+        # ─────────────────────────────────────────────────────────────────────
+
+        # ─── LOGIN CHECK & CLIENT SETUP (once, before the loop) ──────────────
+        user_data = await db.get_session(message.from_user.id)
+        if user_data is None and (is_private or is_batch):
+            batch_temp.IS_BATCH[message.from_user.id] = True
+            return await message.reply("**__For Downloading Restricted Content You Have To /login First.__**")
+
+        acc = None
+        if user_data:
+            try:
+                acc = Client(
+                    "saverestricted",
+                    session_string=user_data,
+                    api_hash=API_HASH,
+                    api_id=API_ID,
+                    in_memory=True,
+                    sleep_threshold=60,
+                    max_concurrent_transmissions=10,  # Parallel chunk streams — key fix for Heroku
+                )
+                await acc.connect()
+            except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
+                batch_temp.IS_BATCH[message.from_user.id] = True
+                await db.set_session(message.from_user.id, None)
+                return await message.reply(
+                    f"**__Your Login Session Invalid/Expired. Please /login again.__**\nError: {e}"
+                )
+            except Exception:
+                batch_temp.IS_BATCH[message.from_user.id] = True
+                return await message.reply(
+                    "**__Your Login Session Error. So /logout First Then Login Again By - /login__**"
+                )
+        # ─────────────────────────────────────────────────────────────────────
+
+        try:
+            for msgid in range(fromID, toID + 1):
+                if batch_temp.IS_BATCH.get(message.from_user.id):
+                    break
+
+                # 1. Try Public Copy (No Login Required)
+                if not is_private and not is_batch:
+                    username = datas[3]
+                    try:
+                        msg = await client.get_messages(username, msgid)
+                        await client.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                        await asyncio.sleep(1)
+                        continue
+                    except Exception as e:
+                        logger.error(f"Public copy failed for {username}/{msgid}: {e}")
+                        # Fallback to login method — check premium now for public-restricted
+                        if acc is None:
+                            import datetime
+                            expiry = await db.check_premium(message.from_user.id)
+                            is_premium_fb = False
+                            if expiry:
+                                try:
+                                    exp_date = datetime.datetime.fromisoformat(expiry)
+                                    if datetime.datetime.now() < exp_date:
+                                        is_premium_fb = True
+                                    else:
+                                        await db.remove_premium(message.from_user.id)
+                                except Exception:
+                                    pass
+                            if not is_premium_fb:
+                                batch_temp.IS_BATCH[message.from_user.id] = True
+                                await message.reply_text(
+                                    "**💎 Premium Required**\n\n"
+                                    "This content is restricted. Downloading it is a **Premium-only** feature.\n\n"
+                                    "Use /premium to upgrade."
+                                )
+                                return
+                            # Need session for fallback
+                            user_data = await db.get_session(message.from_user.id)
+                            if user_data is None:
+                                batch_temp.IS_BATCH[message.from_user.id] = True
+                                await message.reply("**__You need to /login first to access restricted content.__**")
+                                return
+                            try:
+                                acc = Client(
+                                    "saverestricted",
+                                    session_string=user_data,
+                                    api_hash=API_HASH,
+                                    api_id=API_ID,
+                                    in_memory=True,
+                                    sleep_threshold=60,
+                                    max_concurrent_transmissions=10,  # Parallel chunk streams
+                                )
+                                await acc.connect()
+                            except Exception as conn_err:
+                                batch_temp.IS_BATCH[message.from_user.id] = True
+                                return await message.reply(f"**Session error:** {conn_err}")
+
+                # 2. Handle Restricted Content (acc already connected above)
+                if acc is None:
+                    batch_temp.IS_BATCH[message.from_user.id] = True
+                    await message.reply("**__Session not available. Please /login first.__**")
+                    return
+
+                if is_private:
+                    chatid = int("-100" + datas[4])
+                    try:
+                        success = await handle_private(client, acc, message, chatid, msgid)
+                    except Exception as e:
+                        logger.error(f"Error handling private chat: {e}")
+                        if ERROR_MESSAGE:
+                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+                elif is_batch:
+                    username = datas[4]
+                    try:
+                        success = await handle_private(client, acc, message, username, msgid)
+                    except Exception as e:
+                        logger.error(f"Error handling batch channel: {e}")
+                        if ERROR_MESSAGE:
+                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+                else:
+                    # Restricted Public Channel fallback
+                    username = datas[3]
+                    try:
+                        success = await handle_private(client, acc, message, username, msgid)
+                    except Exception as e:
+                        logger.error(f"Error copy/handle private: {e}")
+                        if ERROR_MESSAGE:
+                            await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+
+                # Random delay between files to mimic human behaviour (20–45s)
+                if msgid < toID and not batch_temp.IS_BATCH.get(message.from_user.id):
+                    delay = random.randint(20, 45)
+                    wait_msg = await client.send_message(
+                        message.chat.id,
+                        f"⏳ **Waiting {delay} seconds before next file to avoid account ban...**"
+                    )
+                    await asyncio.sleep(delay)
+                    await wait_msg.delete()
+
+        finally:
+            if acc is not None:
+                try:
+                    await acc.disconnect()
+                except Exception:
+                    pass
+
+        batch_temp.IS_BATCH[message.from_user.id] = True
+
+# -------------------
+# Handle private content with retry mechanism
+# -------------------
+
+async def handle_private(client: Client, acc, message: Message, chatid: int, msgid: int):
+    max_retries = 10
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            msg: Message = await acc.get_messages(chatid, msgid)
+        except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
+            batch_temp.IS_BATCH[message.from_user.id] = True
+            await db.set_session(message.from_user.id, None)
+            await client.send_message(message.chat.id, f"Session Token Invalid/Expired. Please /login again.\nError: {e}")
+            return False
+        except Exception as e:
+            logger.warning(f"Error fetching message: {e}. Trying resolve_peer...")
+            try:
+                await acc.resolve_peer(chatid)
+                msg: Message = await acc.get_messages(chatid, msgid)
+            except (AuthKeyUnregistered, UserDeactivated, UserDeactivatedBan) as e:
+                batch_temp.IS_BATCH[message.from_user.id] = True
+                await db.set_session(message.from_user.id, None)
+                await client.send_message(message.chat.id, f"Session Token Invalid/Expired. Please /login again.\nError: {e}")
+                return False
+            except Exception as e2:
+                logger.error(f"Retry failed: {e2}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    return False
+
+        if msg.empty:
+            retry_count += 1
+            if retry_count < max_retries:
+                await asyncio.sleep(5)
+                continue
+            else:
+                return False
+
+        msg_type = get_message_type(msg)
+        if not msg_type:
+            retry_count += 1
+            if retry_count < max_retries:
+                await asyncio.sleep(5)
+                continue
+            else:
+                return False
+
+        chat = message.chat.id
+        if batch_temp.IS_BATCH.get(message.from_user.id):
+            return False
+
+        if "Text" == msg_type:
+            try:
+                await client.send_message(chat, msg.text, entities=msg.entities, reply_to_message_id=message.id)
+                return True
+            except Exception as e:
+                logger.error(f"Error sending text message: {e}")
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    return False
+
+        if "Poll" == msg_type:
+            try:
+                poll = msg.poll
+                options = [opt.text for opt in poll.options]
+                kwargs = dict(
+                    chat_id=chat,
+                    question=poll.question,
+                    options=options,
+                    is_anonymous=poll.is_anonymous,
+                    allows_multiple_answers=poll.allows_multiple_answers,
+                    reply_to_message_id=message.id,
+                )
+                if poll.type == enums.PollType.QUIZ:
+                    kwargs["type"] = enums.PollType.QUIZ
+                    kwargs["correct_option_id"] = poll.correct_option_id
+                    if poll.explanation:
+                        kwargs["explanation"] = poll.explanation
+                        kwargs["explanation_parse_mode"] = enums.ParseMode.HTML
+                await client.send_poll(**kwargs)
+                return True
+            except Exception as e:
+                logger.error(f"Error sending poll/quiz: {e}")
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}",
+                                              reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    return False
+
+        smsg = await client.send_message(message.chat.id, '**__Downloading 🚀__**', reply_to_message_id=message.id)
+        
+        temp_dir = f"downloads/{message.id}_{msgid}"
+        if not os.path.exists(temp_dir):
+            os.makedirs(temp_dir)
+
+        try:
+            asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+        except Exception as e:
+            logger.error(f"Error creating download status task: {e}")
+            
+        file_path = None
+        download_success = False
+        
+        try:
+            timestamp = int(time.time())
+            temp_file_name = f"file_{timestamp}"
+            file_path = await acc.download_media(
+                msg, 
+                file_name=os.path.join(temp_dir, temp_file_name), 
+                progress=progress, 
+                progress_args=[message, "down"]
+            )
+            
+            if file_path and os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                if file_size > 0:
+                    download_success = True
+                    logger.info(f"File downloaded successfully: {file_path}, Size: {humanbytes(file_size)}")
+                else:
+                    logger.warning(f"Downloaded file is empty (0 bytes): {file_path}")
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    raise Exception("File size equals to 0 B")
+            else:
+                raise Exception("File download failed or file not found")
+            
+            if os.path.exists(f'{message.id}downstatus.txt'):
+                os.remove(f'{message.id}downstatus.txt')
+                
+        except Exception as e:
+            if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
+                if os.path.exists(f'{message.id}downstatus.txt'):
+                    try:
+                        os.remove(f'{message.id}downstatus.txt')
+                    except:
+                        pass
+                
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+            
+                await smsg.edit("❌ **Task Cancelled**")
+                return False
+                
+            logger.error(f"Error downloading media (attempt {retry_count + 1}/{max_retries}): {e}")
+            
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+                    
+            retry_count += 1
+            if retry_count < max_retries:
+                await smsg.edit(f"⚠️ **Download failed. Retrying... ({retry_count}/{max_retries})**")
+                await asyncio.sleep(5)
+                continue
+            else:
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                await smsg.delete()
+                return False
+
+        if not download_success:
+            retry_count += 1
+            if retry_count < max_retries:
+                await smsg.edit(f"⚠️ **Download incomplete. Retrying... ({retry_count}/{max_retries})**")
+                await asyncio.sleep(5)
+                continue
+
+        if batch_temp.IS_BATCH.get(message.from_user.id):
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            return False
+
+        try:
+            asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
+        except Exception as e:
+            logger.error(f"Error creating upload status task: {e}")
+            
+        caption = msg.caption if msg.caption else None
+        
+        if batch_temp.IS_BATCH.get(message.from_user.id):
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            return False
+
+        upload_success = False
+        try:
+            # ==================== NEW THUMBNAIL HANDLING ====================
+            if "Document" == msg_type:
+                ph_path = await get_thumb(message.from_user.id, acc, "Document", msg, file_path)
+                file_name = None
+                if hasattr(msg.document, 'file_name') and msg.document.file_name:
+                    file_name = sanitize_filename(msg.document.file_name)
+                await client.send_document(
+                    chat, file_path, thumb=ph_path, caption=caption,
+                    reply_to_message_id=message.id, file_name=file_name,
+                    parse_mode=enums.ParseMode.HTML, progress=progress,
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+                if ph_path and os.path.exists(ph_path):
+                    os.remove(ph_path)
+
+            elif "Video" == msg_type:
+                ph_path = await get_thumb(message.from_user.id, acc, "Video", msg, file_path)
+                file_name = None
+                if hasattr(msg.video, 'file_name') and msg.video.file_name:
+                    file_name = sanitize_filename(msg.video.file_name)
+                await client.send_video(
+                    chat, file_path, duration=msg.video.duration, width=msg.video.width,
+                    height=msg.video.height, thumb=ph_path, caption=caption,
+                    reply_to_message_id=message.id, file_name=file_name,
+                    parse_mode=enums.ParseMode.HTML, progress=progress,
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+                if ph_path and os.path.exists(ph_path):
+                    os.remove(ph_path)
+
+            elif "Audio" == msg_type:
+                ph_path = await get_thumb(message.from_user.id, acc, "Audio", msg, file_path)
+                file_name = None
+                if hasattr(msg.audio, 'file_name') and msg.audio.file_name:
+                    file_name = sanitize_filename(msg.audio.file_name)
+                    if not file_name.lower().endswith(('.mp3', '.m4a', '.flac', '.wav')):
+                        file_name = f"{file_name}.mp3"
+                await client.send_audio(
+                    chat, file_path, thumb=ph_path, caption=caption,
+                    reply_to_message_id=message.id, file_name=file_name,
+                    parse_mode=enums.ParseMode.HTML, progress=progress,
+                    progress_args=[message, "up"]
+                )
+                upload_success = True
+                if ph_path and os.path.exists(ph_path):
+                    os.remove(ph_path)
+
+            # ==================== END OF NEW THUMBNAIL HANDLING ====================
+
+            elif "Animation" == msg_type:
+                await client.send_animation(chat, file_path, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+                upload_success = True
+
+            elif "Sticker" == msg_type:
+                await client.send_sticker(chat, file_path, reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML)
+                upload_success = True
+
+            elif "Voice" == msg_type:
+                await client.send_voice(
+                    chat, file_path, caption=caption, caption_entities=msg.caption_entities,
+                    reply_to_message_id=message.id, parse_mode=enums.ParseMode.HTML,
+                    progress=progress, progress_args=[message, "up"]
+                )
+                upload_success = True
+
+            elif "Photo" == msg_type:
+                if not file_path.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp')):
+                    new_photo_path = file_path + '.jpg'
+                    os.rename(file_path, new_photo_path)
+                    file_path = new_photo_path
+                await client.send_photo(
+                    chat, file_path, caption=caption, reply_to_message_id=message.id,
+                    parse_mode=enums.ParseMode.HTML
+                )
+                upload_success = True
+                
+        except Exception as e:
+            if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
+                if os.path.exists(f'{message.id}upstatus.txt'):
+                    try:
+                        os.remove(f'{message.id}upstatus.txt')
+                    except:
+                        pass
+                
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+                await smsg.edit("❌ **Task Cancelled**")
+                return False
+
+            logger.error(f"Error sending media (attempt {retry_count + 1}/{max_retries}): {e}")
+            
+            retry_count += 1
+            if retry_count < max_retries:
+                await smsg.edit(f"⚠️ **Upload failed. Retrying... ({retry_count}/{max_retries})**")
+                await asyncio.sleep(5)
+                continue
+            else:
+                if ERROR_MESSAGE:
+                    await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
+                                              parse_mode=enums.ParseMode.HTML)
+                if os.path.exists(f'{message.id}upstatus.txt'):
+                    os.remove(f'{message.id}upstatus.txt')
+                if os.path.exists(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+                await smsg.delete()
+                return False
+
+        if os.path.exists(f'{message.id}upstatus.txt'):
+            os.remove(f'{message.id}upstatus.txt')
+            
+        if os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+
+        await client.delete_messages(message.chat.id, [smsg.id])
+        
+        batch_temp.LAST_UPLOAD_TIME[message.from_user.id] = time.time()
+        
+        return upload_success
+    
+    return False
+
+#-------------------
+# Get message type
+# -------------------
+
+def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
+    try:
+        msg.document.file_id
+        return "Document"
+    except:
+        pass
+    try:
+        msg.video.file_id
+        return "Video"
+    except:
+        pass
+    try:
+        msg.animation.file_id
+        return "Animation"
+    except:
+        pass
+    try:
+        msg.sticker.file_id
+        return "Sticker"
+    except:
+        pass
+    try:
+        msg.voice.file_id
+        return "Voice"
+    except:
+        pass
+    try:
+        msg.audio.file_id
+        return "Audio"
+    except:
+        pass
+    try:
+        msg.photo.file_id
+        return "Photo"
+    except:
+        pass
+    try:
+        msg.poll.id
+        return "Poll"
+    except:
+        pass
+    try:
+        msg.text
+        return "Text"
+    except:
+        pass
+
+# -------------------
+# Sanitize filename function
+# -------------------
+
+def sanitize_filename(filename):
+    import re
+    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    filename = ''.join(char for char in filename if ord(char) >= 32)
+    filename = filename.strip('. ')
+    if len(filename) > 200:
+        name, ext = os.path.splitext(filename)
+        filename = name[:200 - len(ext)] + ext
+    return filename
+
+# -------------------
+# Inline button callback
+# -------------------
+
+@Client.on_callback_query()
+async def button_callbacks(client: Client, callback_query):
+    data = callback_query.data
+    message = callback_query.message
+
+    if data == "help_btn":
+        help_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Cʟᴏsᴇ ❌", callback_data="close_btn"),
+                InlineKeyboardButton("⬅️ Bᴀᴄᴋ", callback_data="start_btn")
+            ]
+        ])
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            text=HELP_TXT,
+            reply_markup=help_buttons,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        await callback_query.answer()
+
+    elif data == "about_btn":
+        me = await client.get_me()
+        about_text = (
+            "<b><blockquote>‣ ℹ️ 𝐁𝐎𝐓 𝐈𝐍𝐅𝐎𝐑𝐌𝐀𝐓𝐈𝐎𝐍</blockquote>\n\n"
+            "<i>• 🤖 𝐍𝐚𝐦𝐞 : 𝐒𝐚𝐯𝐞 𝐑𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐂𝐨𝐧𝐭𝐞𝐧𝐭\n"
+            "• 👨‍💻 𝐎𝐰𝐧𝐞𝐫 : <a href='https://t.me/RexBots_Official'>𝐑𝐞𝐱𝐁𝐨𝐭𝐬</a>\n"
+            "• 📡 𝐔𝐩𝐝𝐚𝐭𝐞𝐬 : <a href='https://t.me/RexBots_Official'>𝐑𝐞𝐱𝐁𝐨𝐭𝐬 𝐎𝐟𝐟𝐢𝐜𝐢𝐚𝐥</a>\n"
+            "• 🐍 𝐋𝐚𝐧𝐠𝐮𝐚𝐠𝐞 : <a href='https://www.python.org/'>𝐏𝐲𝐭𝐡𝐨𝐧 𝟑</a>\n"
+            "• 📚 𝐋𝐢𝐛𝐫𝐚𝐫𝐲 : <a href='https://docs.pyrogram.org/'>𝐏𝐲𝐫𝐨𝐠𝐫𝐚𝐦</a>\n"
+            "• 🗄 𝐃𝐚𝐭𝐚𝐛𝐚𝐬𝐄 : <a href='https://www.mongodb.com/'>𝐌𝐨𝐧𝐠𝐨𝐃𝐁</a>\n"
+            "• 📊 𝐕𝐞𝐫𝐬𝐢𝐨𝐧 : 𝟐.𝟎.𝟏 [𝐒𝐭𝐚𝐛𝐥𝐞]</i></b>"
+        )
+
+        about_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📢 Join Channel", url="https://t.me/RexBots_Official")
+            ],
+            [
+                InlineKeyboardButton("❌ Close", callback_data="close_btn"),
+                InlineKeyboardButton("🔙 Back", callback_data="start_btn")
+            ]
+        ])
+
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            text=about_text,
+            reply_markup=about_buttons,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        await callback_query.answer()
+
+    elif data == "start_btn":
+        start_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("🆘 How To Use", callback_data="help_btn"),
+                InlineKeyboardButton("ℹ️ About Bot", callback_data="about_btn")
+            ],
+            [
+                InlineKeyboardButton('📢 Official Channel', url='https://t.me/RexBots_Official'),
+                InlineKeyboardButton('👨‍💻 Developer', url='https://t.me/RexBots_Official')
+            ]
+        ])
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            text=(
+                f"<blockquote><b>👋 Welcome {callback_query.from_user.mention}!</b></blockquote>\n\n"
+                "<b>I am the Advanced Save Restricted Content Bot by RexBots.</b>\n\n"
+                "<blockquote><b>🚀 What I Can Do:</b>\n"
+                "<b>‣ Save Restricted Post (Text, Media, Files)</b>\n"
+                "<b>‣ Support Private & Public Channels</b>\n"
+                "<b>‣ Batch/Bulk Mode Supported</b></blockquote>\n\n"
+                "<blockquote><b>⚠️ Note:</b> <i>You must <code>/login</code> to your account to use the downloading features.</i></blockquote>"
+            ),
+            reply_markup=start_buttons,
+            parse_mode=enums.ParseMode.HTML
+        )
+        await callback_query.answer()
+
+    elif data == "settings_btn":
+        settings_buttons = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("❌ Close", callback_data="close_btn"),
+                InlineKeyboardButton("🔙 Back", callback_data="start_btn")
+            ]
+        ])
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            text=COMMANDS_TXT,
+            reply_markup=settings_buttons,
+            parse_mode=enums.ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        await callback_query.answer()
+
+    elif data == "close_btn":
+        await client.delete_messages(message.chat.id, [message.id])
+        await callback_query.answer()
+
+# Don't remove Credits
+# Rexbots
+# Developer Telegram @RexBots_Official
+# Update channel - @RexBots_Official
