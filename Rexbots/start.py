@@ -265,6 +265,9 @@ class batch_temp(object):
     # Store last upload time for each user
     LAST_UPLOAD_TIME = {}
 
+# In-memory progress storage — replaces slow disk-based status files
+_progress_data: dict = {}
+
 # -------------------
 # Supported Telegram Reactions
 # -------------------
@@ -289,33 +292,39 @@ PROGRESS_BAR_DASHBOARD  = """\
 # Download status
 # -------------------
 
-async def downstatus(client, statusfile, message, chat):
-    while not os.path.exists(statusfile):
-        await asyncio.sleep(3)
-    while os.path.exists(statusfile):
+async def downstatus(client, task_key, message, chat):
+    # Wait until progress data appears in memory
+    for _ in range(20):
+        if task_key in _progress_data:
+            break
+        await asyncio.sleep(1)
+    while task_key in _progress_data:
         try:
-            with open(statusfile, "r", encoding='utf-8') as downread:
-                txt = downread.read()
-            await client.edit_message_text(chat, message.id, f"📥 **Downloading...**\n\n{txt}")
-            await asyncio.sleep(10)
+            txt = _progress_data.get(task_key, "")
+            if txt:
+                await client.edit_message_text(chat, message.id, f"📥 **Downloading...**\n\n{txt}")
         except:
-            await asyncio.sleep(5)
+            pass
+        await asyncio.sleep(10)
 
 # -------------------
 # Upload status
 # -------------------
 
-async def upstatus(client, statusfile, message, chat):
-    while not os.path.exists(statusfile):
-        await asyncio.sleep(3)
-    while os.path.exists(statusfile):
+async def upstatus(client, task_key, message, chat):
+    # Wait until progress data appears in memory
+    for _ in range(20):
+        if task_key in _progress_data:
+            break
+        await asyncio.sleep(1)
+    while task_key in _progress_data:
         try:
-            with open(statusfile, "r", encoding='utf-8') as upread:
-                txt = upread.read()
-            await client.edit_message_text(chat, message.id, f"📤 **Uploading...**\n\n{txt}")
-            await asyncio.sleep(10)
+            txt = _progress_data.get(task_key, "")
+            if txt:
+                await client.edit_message_text(chat, message.id, f"📤 **Uploading...**\n\n{txt}")
         except:
-            await asyncio.sleep(5)
+            pass
+        await asyncio.sleep(10)
 
 # -------------------
 # Progress writer
@@ -349,7 +358,7 @@ def progress(current, total, message, type):
             elapsed = now - progress.start_time[task_id]
             
             # Progress Bar
-            filled_length = int(percentage / 10) # 10 blocks for 100%
+            filled_length = int(percentage / 10)
             bar = '▰' * filled_length + '▱' * (10 - filled_length)
             
             status = PROGRESS_BAR_DASHBOARD.format(
@@ -362,15 +371,14 @@ def progress(current, total, message, type):
                 elapsed=TimeFormatter(elapsed * 1000)
             )
             
-            with open(f'{message.id}{type}status.txt', "w", encoding='utf-8') as fileup:
-                fileup.write(status)
-                
-            progress.cache[task_id] = now
-            
+            # Write to in-memory dict — no disk I/O
             if current == total:
-                # Cleanup cache
+                _progress_data.pop(task_id, None)
                 progress.start_time.pop(task_id, None)
                 progress.cache.pop(task_id, None)
+            else:
+                _progress_data[task_id] = status
+                progress.cache[task_id] = now
                 
         except:
             pass
@@ -501,6 +509,7 @@ async def save(client: Client, message: Message):
                     api_id=API_ID,
                     in_memory=True,
                     sleep_threshold=60,
+                    workers=16,
                     max_concurrent_transmissions=10,  # Parallel chunk streams — key fix for Heroku
                 )
                 await acc.connect()
@@ -568,6 +577,7 @@ async def save(client: Client, message: Message):
                                     api_id=API_ID,
                                     in_memory=True,
                                     sleep_threshold=60,
+                                    workers=16,
                                     max_concurrent_transmissions=10,  # Parallel chunk streams
                                 )
                                 await acc.connect()
@@ -740,7 +750,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             os.makedirs(temp_dir)
 
         try:
-            asyncio.create_task(downstatus(client, f'{message.id}downstatus.txt', smsg, chat))
+            asyncio.create_task(downstatus(client, f'{message.id}down', smsg, chat))
         except Exception as e:
             logger.error(f"Error creating download status task: {e}")
             
@@ -770,16 +780,12 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             else:
                 raise Exception("File download failed or file not found")
             
-            if os.path.exists(f'{message.id}downstatus.txt'):
-                os.remove(f'{message.id}downstatus.txt')
+            # Clear in-memory progress entry for download
+            _progress_data.pop(f'{message.id}down', None)
                 
         except Exception as e:
             if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
-                if os.path.exists(f'{message.id}downstatus.txt'):
-                    try:
-                        os.remove(f'{message.id}downstatus.txt')
-                    except:
-                        pass
+                _progress_data.pop(f'{message.id}down', None)
                 
                 if os.path.exists(temp_dir):
                     try:
@@ -826,7 +832,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
             return False
 
         try:
-            asyncio.create_task(upstatus(client, f'{message.id}upstatus.txt', smsg, chat))
+            asyncio.create_task(upstatus(client, f'{message.id}up', smsg, chat))
         except Exception as e:
             logger.error(f"Error creating upload status task: {e}")
             
@@ -922,11 +928,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 
         except Exception as e:
             if batch_temp.IS_BATCH.get(message.from_user.id) or "Cancelled" in str(e):
-                if os.path.exists(f'{message.id}upstatus.txt'):
-                    try:
-                        os.remove(f'{message.id}upstatus.txt')
-                    except:
-                        pass
+                _progress_data.pop(f'{message.id}up', None)
                 
                 if os.path.exists(temp_dir):
                     try:
@@ -947,8 +949,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 if ERROR_MESSAGE:
                     await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id,
                                               parse_mode=enums.ParseMode.HTML)
-                if os.path.exists(f'{message.id}upstatus.txt'):
-                    os.remove(f'{message.id}upstatus.txt')
+                _progress_data.pop(f'{message.id}up', None)
                 if os.path.exists(temp_dir):
                     try:
                         shutil.rmtree(temp_dir)
@@ -957,8 +958,7 @@ async def handle_private(client: Client, acc, message: Message, chatid: int, msg
                 await smsg.delete()
                 return False
 
-        if os.path.exists(f'{message.id}upstatus.txt'):
-            os.remove(f'{message.id}upstatus.txt')
+        _progress_data.pop(f'{message.id}up', None)
             
         if os.path.exists(temp_dir):
             try:
